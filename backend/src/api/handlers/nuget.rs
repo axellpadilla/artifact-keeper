@@ -11,6 +11,7 @@
 //!   GET  /nuget/{repo_key}/v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg — Download
 //!   PUT  /nuget/{repo_key}/api/v2/package                                     — Push package
 
+use std::future::Future;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -30,6 +31,7 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
+use crate::error::AppError;
 use crate::models::repository::RepositoryType;
 use crate::services::auth_service::AuthService;
 
@@ -557,13 +559,39 @@ async fn flatcontainer_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let upstream_filename = filename.clone();
+    let content = if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            get_remote_cached_or_refetch(storage.as_ref(), &artifact.storage_key, || async move {
+                let upstream_path = format!(
+                    "v3/flatcontainer/{}/{}/{}",
+                    package_id_lower, version, upstream_filename
+                );
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path)
+                    .await
+                    .map(|(content, _content_type)| content)
+            })
+            .await?
+        } else {
+            storage.get(&artifact.storage_key).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Storage error: {}", e),
+                )
+                    .into_response()
+            })?
+        }
+    } else {
+        storage.get(&artifact.storage_key).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     // Record download.
     let _ = sqlx::query!(
@@ -583,6 +611,32 @@ async fn flatcontainer_download(
         .header(CONTENT_LENGTH, content.len().to_string())
         .body(Body::from(content))
         .unwrap())
+}
+
+async fn get_remote_cached_or_refetch<F, Fut>(
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+    refetch: F,
+) -> Result<Bytes, Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Bytes, Response>>,
+{
+    match storage.get(storage_key).await {
+        Ok(content) => Ok(content),
+        Err(AppError::NotFound(_)) => {
+            tracing::warn!(
+                storage_key = %storage_key,
+                "remote NuGet proxy cache entry is missing on disk; re-fetching from upstream"
+            );
+            refetch().await
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,6 +1228,59 @@ mod tests {
         let body = Bytes::from_static(b"raw content");
         let result = extract_nupkg_bytes(&headers, body.clone()).unwrap();
         assert_eq!(result, body);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_remote_cached_or_refetch
+    // -----------------------------------------------------------------------
+
+    struct MissingStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for MissingStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound("missing cache entry".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
+        let storage = MissingStorage;
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let content = super::get_remote_cached_or_refetch(
+            &storage,
+            "proxy-cache/nuget-remote/v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"refetched-bytes"))
+                }
+            },
+        )
+        .await
+        .expect("refetch should succeed");
+
+        assert_eq!(content, Bytes::from_static(b"refetched-bytes"));
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "missing proxy-cache entry should trigger exactly one upstream refetch"
+        );
     }
 
     // -----------------------------------------------------------------------
